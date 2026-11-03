@@ -6,7 +6,7 @@
 
 use quick_xml::XmlVersion;
 use quick_xml::events::Event;
-use quick_xml::name::ResolveResult;
+use quick_xml::name::{QName, ResolveResult};
 use quick_xml::reader::NsReader;
 
 use crate::DocxError;
@@ -15,6 +15,8 @@ use crate::DocxError;
 pub const MAX_DEPTH: usize = 256;
 /// Maximum number of elements in one part.
 pub const MAX_ELEMENTS: usize = 8_000_000;
+/// Maximum number of attributes on one element (#3702).
+pub const MAX_ATTRS: usize = 1024;
 
 /// Known namespaces and the canonical prefix we use for them (read and write).
 pub const NAMESPACES: &[(&str, &str)] = &[
@@ -26,20 +28,38 @@ pub const NAMESPACES: &[(&str, &str)] = &[
     ("pic", "http://schemas.openxmlformats.org/drawingml/2006/picture"),
     ("mc", "http://schemas.openxmlformats.org/markup-compatibility/2006"),
     ("w14", "http://schemas.microsoft.com/office/word/2010/wordml"),
+    ("wpi", "http://schemas.microsoft.com/office/word/2010/wordprocessingInk"),
     ("w15", "http://schemas.microsoft.com/office/word/2012/wordml"),
     ("wp14", "http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing"),
     ("wps", "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"),
     ("wpg", "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"),
+    ("wpc", "http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"),
     ("dgm", "http://schemas.openxmlformats.org/drawingml/2006/diagram"),
     ("dsp", "http://schemas.microsoft.com/office/drawing/2008/diagram"),
     ("m", "http://schemas.openxmlformats.org/officeDocument/2006/math"),
     ("v", "urn:schemas-microsoft-com:vml"),
     ("o", "urn:schemas-microsoft-com:office:office"),
     ("w10", "urn:schemas-microsoft-com:office:word"),
+    // Office 2016 charts (`cx:chart`), and the namespaces their `mc:Choice` requires.
+    ("cx", "http://schemas.microsoft.com/office/drawing/2014/chartex"),
+    ("cx1", "http://schemas.microsoft.com/office/drawing/2015/9/8/chartex"),
+    ("cx2", "http://schemas.microsoft.com/office/drawing/2015/10/21/chartex"),
+    ("cx3", "http://schemas.microsoft.com/office/drawing/2016/5/9/chartex"),
+    ("cx4", "http://schemas.microsoft.com/office/drawing/2016/5/10/chartex"),
+    ("cx5", "http://schemas.microsoft.com/office/drawing/2016/5/11/chartex"),
+    ("cx6", "http://schemas.microsoft.com/office/drawing/2016/5/12/chartex"),
+    ("cx7", "http://schemas.microsoft.com/office/drawing/2016/5/13/chartex"),
+    ("cx8", "http://schemas.microsoft.com/office/drawing/2016/5/14/chartex"),
 ];
+
+/// The `a:ext` URI under which a drawing is marked decorative ([MS-ODRAWXML]), and the
+/// namespace of its `adec:decorative` element.
+pub const DECORATIVE_EXT: &str = "{C183D7F6-B498-43B3-948B-1728B52AA6E4}";
+pub const DECORATIVE_NS: &str = "http://schemas.microsoft.com/office/drawing/2017/decorative";
 
 /// Namespaces that only appear in non-body parts.
 const OTHER_NAMESPACES: &[(&str, &str)] = &[
+    ("b", "http://schemas.openxmlformats.org/officeDocument/2006/bibliography"),
     ("rel", "http://schemas.openxmlformats.org/package/2006/relationships"),
     ("ct", "http://schemas.openxmlformats.org/package/2006/content-types"),
     ("cp", "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"),
@@ -62,7 +82,10 @@ const STRICT: &[(&str, &str)] = &[
     ("m", "http://purl.oclc.org/ooxml/officeDocument/math"),
 ];
 
-fn prefix_for(uri: &[u8]) -> &'static str {
+fn prefix_for(uri: &[u8], extra: &[(&'static str, &str)]) -> &'static str {
+    if let Some((p, _)) = extra.iter().find(|(_, u)| u.as_bytes() == uri) {
+        return p;
+    }
     for (p, u) in NAMESPACES.iter().chain(OTHER_NAMESPACES).chain(STRICT) {
         if u.as_bytes() == uri {
             return p;
@@ -71,10 +94,74 @@ fn prefix_for(uri: &[u8]) -> &'static str {
     "?"
 }
 
+/// Compatibility feature namespaces whose elements are not otherwise handled by this tree.
+/// Keep the reader's existing feature set when canonicalizing `mc:Choice/@Requires` aliases.
+fn requirement_prefix(uri: &[u8]) -> &'static str {
+    let prefix = prefix_for(uri, &[]);
+    if prefix != "?" {
+        return prefix;
+    }
+    match uri {
+        b"http://schemas.microsoft.com/office/drawing/2010/main" => "a14",
+        b"http://schemas.microsoft.com/office/word/2015/wordml/symex" => "w16se",
+        b"http://schemas.microsoft.com/office/word/2016/wordml/cid" => "w16cid",
+        b"http://schemas.microsoft.com/office/word/2018/wordml" => "w16",
+        b"http://schemas.microsoft.com/office/word/2018/wordml/cex" => "w16cex",
+        b"http://schemas.microsoft.com/office/word/2020/wordml/sdtdatahash" => "w16sdtdh",
+        _ => "?",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
     El(El),
     Text(String),
+}
+
+/// Elements whose markup names a relationship: the id is in an attribute of the relationship
+/// namespace (`r:id`, `r:embed`, `r:link`, `r:pict`, `r:dm`…) or VML's `o:relid`, and — from a
+/// producer that left the prefix out — in the unqualified attribute of the same local name, the
+/// alias [`El::attr`] accepts. On any other element an unqualified `id` is the element's own
+/// (a drawing's `wp:docPr`, a picture's `pic:cNvPr`, a VML shape, a page background) and names
+/// no part.
+const REL_ELEMENTS: &[&str] = &[
+    "a:blip",
+    "a:hlinkClick",
+    "a:hlinkHover",
+    "a:audioFile",
+    "a:videoFile",
+    "c:chart",
+    "cx:chart",
+    "dgm:relIds",
+    "o:OLEObject",
+    "v:fill",
+    "v:imagedata",
+    "w:attachedTemplate",
+    "w:control",
+    "w:embedBold",
+    "w:embedBoldItalic",
+    "w:embedItalic",
+    "w:embedRegular",
+    "w:footerReference",
+    "w:headerReference",
+    "w:hyperlink",
+    "w:object",
+    "w:subDoc",
+    "w14:contentPart",
+];
+
+/// The local names a relationship attribute has, so an unqualified one is recognised as the
+/// relationship id it names.
+const REL_ALIASES: &[&str] = &["id", "embed", "link", "pict", "dm", "lo", "qs", "cs", "relid"];
+
+/// Is the attribute `k` of the element named `element` a relationship id?
+///
+/// The relationship namespace (`r:`) and VML's `o:relid` always are. An unqualified attribute
+/// is one only on an element that carries a relationship ([`REL_ELEMENTS`]) and only with the
+/// local name of a relationship attribute ([`REL_ALIASES`]) — the alias [`El::attr`] accepts.
+/// Everywhere else an unqualified `id` is the element's own and names no part.
+pub fn is_rel_attr(element: &str, k: &str) -> bool {
+    k.starts_with("r:") || k == "o:relid" || (REL_ELEMENTS.contains(&element) && REL_ALIASES.contains(&k))
 }
 
 /// An element with canonical-prefixed name and attributes.
@@ -204,10 +291,9 @@ impl El {
     }
 }
 
-/// Parse XML bytes into the root element.
 /// UTF-16 LE/BE text with a byte-order mark as UTF-8 (`None` without one). Lossy: an unpaired
 /// surrogate becomes U+FFFD and a trailing odd byte is dropped. The result is at most 1.5× the input.
-fn utf16_to_utf8(bytes: &[u8]) -> Option<String> {
+pub(crate) fn utf16_to_utf8(bytes: &[u8]) -> Option<String> {
     let (rest, le) = match bytes.get(..2) {
         Some([0xFF, 0xFE]) => (bytes.get(2..)?, true),
         Some([0xFE, 0xFF]) => (bytes.get(2..)?, false),
@@ -217,7 +303,24 @@ fn utf16_to_utf8(bytes: &[u8]) -> Option<String> {
     Some(char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect())
 }
 
+/// Parse XML bytes into the root element.
 pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
+    parse_ns(bytes, &[])
+}
+
+/// [`parse`] with `extra` namespaces (prefix, URI) mapped to canonical prefixes first, so a
+/// related vocabulary (WordprocessingML 2003) reads with the prefixes the reader knows.
+pub fn parse_ns(bytes: &[u8], extra: &[(&'static str, &str)]) -> Result<El, DocxError> {
+    parse_with(bytes, extra, false)
+}
+
+/// [`parse`] for a part whose loss would be silent data loss (the main document): a mismatched end
+/// tag or an element left open at the end of the data is an error, not a cue to stop reading.
+pub fn parse_strict(bytes: &[u8]) -> Result<El, DocxError> {
+    parse_with(bytes, &[], true)
+}
+
+fn parse_with(bytes: &[u8], extra: &[(&'static str, &str)], strict: bool) -> Result<El, DocxError> {
     // UTF-16 (with a BOM) is transcoded to UTF-8; a UTF-8 BOM is stripped.
     let transcoded = utf16_to_utf8(bytes);
     let bytes = match &transcoded {
@@ -230,7 +333,7 @@ pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
         c.trim_text_start = false;
         c.trim_text_end = false;
         c.expand_empty_elements = false;
-        c.check_end_names = false;
+        c.check_end_names = strict;
     }
     let mut stack: Vec<El> = Vec::new();
     let mut root: Option<El> = None;
@@ -240,11 +343,14 @@ pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
         buf.clear();
         let (res, ev) = r.read_resolved_event_into(&mut buf).map_err(|e| DocxError::Xml(e.to_string()))?;
         let el_prefix = match &res {
-            ResolveResult::Bound(ns) => Some(prefix_for(ns.as_ref())),
+            ResolveResult::Bound(ns) => Some(prefix_for(ns.as_ref(), extra)),
             _ => None,
         };
         match ev {
             Event::Start(ref e) | Event::Empty(ref e) => {
+                if strict && root.is_some() && stack.is_empty() {
+                    return Err(DocxError::Xml("more than one root element".into()));
+                }
                 count += 1;
                 if count > MAX_ELEMENTS {
                     return Err(DocxError::Limit("too many XML elements".into()));
@@ -256,6 +362,9 @@ pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
                 };
                 let mut el = El { name, attrs: Vec::new(), kids: Vec::new() };
                 for a in e.attributes().with_checks(false) {
+                    if el.attrs.len() >= MAX_ATTRS {
+                        return Err(DocxError::Limit("too many attributes on one element".into()));
+                    }
                     let Ok(a) = a else { continue };
                     let key = a.key;
                     let raw_key = key.as_ref();
@@ -265,12 +374,34 @@ pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
                     let (ares, alocal) = r.resolver_mut().resolve_attribute(key);
                     let alocal = String::from_utf8_lossy(alocal.as_ref()).into_owned();
                     let aname = match ares {
-                        ResolveResult::Bound(ns) => format!("{}:{alocal}", prefix_for(ns.as_ref())),
+                        ResolveResult::Bound(ns) => format!("{}:{alocal}", prefix_for(ns.as_ref(), extra)),
                         _ => alocal,
                     };
                     let val = match a.normalized_value(XmlVersion::Explicit1_0) {
                         Ok(v) => v.into_owned(),
                         Err(_) => String::from_utf8_lossy(&a.value).into_owned(),
+                    };
+                    // Requires contains namespace prefixes, not feature names. Resolve them while
+                    // the namespace scope still exists; declarations are omitted from this tree.
+                    let val = if el.name == "mc:Choice" && aname == "Requires" {
+                        let requirements: Vec<_> = val.split_whitespace().take(65).collect();
+                        if requirements.len() > 64 || requirements.iter().any(|prefix| prefix.len() > 128) {
+                            "?".to_string()
+                        } else {
+                            requirements
+                                .into_iter()
+                                .map(|prefix| {
+                                    let qualified = format!("{prefix}:requirement");
+                                    match r.resolver_mut().resolve_attribute(QName(qualified.as_bytes())).0 {
+                                        ResolveResult::Bound(ns) => requirement_prefix(ns.as_ref()),
+                                        _ => "?",
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        }
+                    } else {
+                        val
                     };
                     el.attrs.push((aname, val));
                 }
@@ -310,17 +441,22 @@ pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
                         }
                         Err(_) => None,
                     };
-                    if let Some(c) = ch {
-                        push_text(top, &c);
+                    match ch {
+                        Some(c) => push_text(top, &c),
+                        None if strict => return Err(DocxError::Xml("an entity is not defined".into())),
+                        None => {}
                     }
                 }
             }
             Event::Eof => break,
             _ => {}
         }
-        if root.is_some() && stack.is_empty() {
+        if !strict && root.is_some() && stack.is_empty() {
             break;
         }
+    }
+    if strict && !stack.is_empty() {
+        return Err(DocxError::Xml("an element is not closed".into()));
     }
     // Unclosed elements at EOF: close them (lenient).
     while let Some(el) = stack.pop() {
@@ -442,6 +578,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strict_parsing_rejects_a_dropped_entity_and_trailing_markup() {
+        let bad = [&b"<w:t>before &unknown; after</w:t>"[..], b"<a></a><b></b>", b"<a></a><b>"];
+        for xml in bad {
+            assert!(parse_strict(xml).is_err(), "{}", String::from_utf8_lossy(xml));
+        }
+        assert!(
+            parse_strict(
+                b"<a>x &amp; y</a>
+"
+            )
+            .is_ok()
+        );
+        assert!(parse(b"<a></a><b></b>").is_ok(), "lenient parsing still stops at the root");
+    }
+
+    #[test]
+    fn a_relationship_attribute_is_the_namespaced_one_or_the_alias_of_one() {
+        // The relationship namespace, and VML's `o:relid`.
+        assert!(is_rel_attr("w:hyperlink", "r:id"));
+        assert!(is_rel_attr("v:imagedata", "o:relid"));
+        // The unqualified alias `El::attr` accepts, on an element that carries a relationship.
+        assert!(is_rel_attr("w:hyperlink", "id"));
+        assert!(is_rel_attr("v:imagedata", "id"));
+        assert!(is_rel_attr("a:blip", "embed"));
+        assert!(is_rel_attr("dgm:relIds", "dm"));
+        // An ordinary `id` — the element's own, naming no part — is not a relationship.
+        assert!(!is_rel_attr("v:shape", "id"));
+        assert!(!is_rel_attr("pic:cNvPr", "id"));
+        assert!(!is_rel_attr("wp:docPr", "id"));
+        assert!(!is_rel_attr("v:background", "id"));
+        // An attribute that is not a relationship attribute at all.
+        assert!(!is_rel_attr("w:hyperlink", "anchor"));
+        assert!(!is_rel_attr("v:imagedata", "title"));
+    }
+
+    #[test]
     fn utf16_parts_parse_and_odd_ones_never_panic() {
         let src = r#"<?xml version="1.0" encoding="UTF-16"?><r:Relationships xmlns:r="urn:x"><r:Relationship Id="rId1" Target="café😀.xml"/></r:Relationships>"#;
         for le in [true, false] {
@@ -474,6 +646,14 @@ mod tests {
     }
 
     #[test]
+    fn choice_requirements_resolve_namespace_aliases_and_rebindings() {
+        let x = br#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:pen="http://schemas.microsoft.com/office/word/2010/wordprocessingInk"><mc:Choice Requires="pen"/><mc:Choice xmlns:pen="urn:future" Requires="pen"/><mc:Choice Requires="undeclared"/></mc:AlternateContent>"#;
+        let e = parse(x).unwrap();
+        let values: Vec<_> = e.children("mc:Choice").map(|c| c.attr("Requires")).collect();
+        assert_eq!(values, [Some("wpi"), Some("?"), Some("?")]);
+    }
+
+    #[test]
     fn deep_nesting_is_error() {
         let mut s = String::new();
         for _ in 0..1000 {
@@ -492,6 +672,39 @@ mod tests {
         }
         s.push_str("><b/></a>");
         assert!(parse(s.as_bytes()).is_err());
+    }
+
+    /// One start tag carrying 200,000 attributes (distinct or duplicate names) is refused or
+    /// truncated instead of allocated: a 59 KB `.docx` used to cost 611 MB (#3702, WC-06).
+    #[test]
+    fn too_many_attributes_on_one_element_is_capped() {
+        // The cap the issue suggests; a fix may pick a lower one, never a higher one.
+        const CAP: usize = 1024;
+        let distinct: String = (0..200_000).map(|i| format!(" a{i}=\"\"")).collect();
+        let duplicate = " a=\"\"".repeat(200_000);
+        for (label, attrs) in [("distinct", distinct), ("duplicate", duplicate)] {
+            let x = format!("<w:p xmlns:w=\"{}\"{attrs}/>", NAMESPACES[0].1);
+            match parse(x.as_bytes()) {
+                Err(DocxError::Limit(_)) => {}
+                Ok(p) => assert!(p.attrs.len() <= CAP, "{label}: kept {} attributes", p.attrs.len()),
+                Err(e) => panic!("{label}: expected a Limit error or a capped element, got {e}"),
+            }
+        }
+        // Real-world attribute counts are untouched.
+        let x = format!(
+            r#"<w:p xmlns:w="{}" w:rsidR="00A1" w:rsidRDefault="00A1" w:rsidP="00A1" w:rsidRPr="00A1"><w:rPr><w:rFonts w:ascii="A" w:hAnsi="B" w:eastAsia="C" w:cs="D" w:asciiTheme="minorHAnsi" w:hAnsiTheme="minorHAnsi" w:eastAsiaTheme="minorEastAsia" w:cstheme="minorBidi" w:hint="eastAsia"/></w:rPr></w:p>"#,
+            NAMESPACES[0].1
+        );
+        let p = parse(x.as_bytes()).unwrap();
+        assert_eq!(p.attrs.len(), 4);
+        let fonts = p.child("w:rPr").and_then(|r| r.child("w:rFonts")).unwrap();
+        assert_eq!(fonts.attrs.len(), 9);
+        assert_eq!(fonts.attr("w:cstheme"), Some("minorBidi"));
+        // Far more than any real producer writes, still well under any sane cap.
+        let many: String = (0..256).map(|i| format!(" a{i}=\"{i}\"")).collect();
+        let p = parse(format!("<p{many}/>").as_bytes()).unwrap();
+        assert_eq!(p.attrs.len(), 256);
+        assert_eq!(p.attr("a255"), Some("255"));
     }
 
     #[test]

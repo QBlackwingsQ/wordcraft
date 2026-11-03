@@ -15,17 +15,153 @@ use crate::theme::{Tokens, regular};
 #[derive(Default)]
 pub struct Previews {
     tex: HashMap<String, TextureHandle>,
-    families: Option<Vec<String>>,
+    /// The font list, for the interface language it was made in.
+    families: Option<(&'static str, Vec<String>)>,
+    font_gen: u64,
+    /// Lowercase English family → its name in that language (simsun → 宋体), and back.
+    local_names: HashMap<String, String>,
+    english_names: HashMap<String, String>,
+    /// The Chinese, Japanese and Korean fonts of the font list (the Asian text font box).
+    east_asian: Option<Vec<String>>,
     styles_hash: (u64, u64),
     /// Previews rendered this frame (rendering is spread over frames).
     budget: std::cell::Cell<u32>,
     frame: u64,
+    /// The Equation tab's pictures, packed into one texture (#1002).
+    math: MathAtlas,
+}
+
+/// Side of each square texture page the equation pictures share, in pixels.
+const MATH_ATLAS: usize = 2048;
+/// At most this many pages: enough for a frame's pictures at a high display scale (the 22
+/// built-in equations alone take two pages at 3×), still a handful of textures in all.
+const MATH_ATLAS_PAGES: usize = 4;
+/// Transparent pixels between pictures, so linear filtering never bleeds one into the next.
+const MATH_ATLAS_GAP: usize = 2;
+
+/// Every equation picture (gallery tiles, structure buttons, symbols) packed into a few shared
+/// textures ("pages"), row by row, and drawn as a part of one (#1002).
+///
+/// They used to be a texture each: hundreds of small textures, created as galleries opened and
+/// all freed at once when the preview cache filled. On Windows (DirectX 12) the tiles then
+/// showed other textures' memory: inverted pictures, red and teal fills, and even damaged
+/// interface letters. A texture written in place is what egui does for its own glyphs; the
+/// atlas creates at most [`MATH_ATLAS_PAGES`] textures and frees none while galleries are
+/// browsed. When every page is full, the page least recently drawn from starts over, but never
+/// one drawn from in the current frame (its pictures are already on screen): a frame whose
+/// pictures don't fit shows the rest as linear text.
+#[derive(Default)]
+struct MathAtlas {
+    pages: Vec<AtlasPage>,
+    /// Picture key → its page and part of that page's texture (UV coordinates).
+    uv: HashMap<String, (usize, Rect)>,
+    /// How many times a page started over (for tests).
+    wipes: u64,
+}
+
+#[derive(Default)]
+struct AtlasPage {
+    tex: Option<TextureHandle>,
+    /// Where the next picture goes: the current row's left edge and top, and the row's height.
+    x: usize,
+    y: usize,
+    row_h: usize,
+    /// The last frame a picture of this page was handed out in.
+    used: u64,
+}
+
+impl AtlasPage {
+    /// A free spot for a `w`×`h` picture, or `None` when the page is full or it can't fit.
+    fn place(&mut self, w: usize, h: usize) -> Option<[usize; 2]> {
+        if w == 0 || h == 0 || w > MATH_ATLAS || h > MATH_ATLAS {
+            return None;
+        }
+        let (mut x, mut y, mut row_h) = (self.x, self.y, self.row_h);
+        if x.saturating_add(w) > MATH_ATLAS {
+            x = 0;
+            y = y.saturating_add(row_h).saturating_add(MATH_ATLAS_GAP);
+            row_h = 0;
+        }
+        if y.saturating_add(h) > MATH_ATLAS {
+            return None;
+        }
+        self.x = x.saturating_add(w).saturating_add(MATH_ATLAS_GAP);
+        self.y = y;
+        self.row_h = row_h.max(h);
+        Some([x, y])
+    }
+
+    /// Forget the page's layout and clear its texture.
+    fn reset(&mut self) {
+        self.x = 0;
+        self.y = 0;
+        self.row_h = 0;
+        if let Some(tex) = &mut self.tex {
+            tex.set(egui::ColorImage::filled([MATH_ATLAS, MATH_ATLAS], egui::Color32::TRANSPARENT), egui::TextureOptions::LINEAR);
+        }
+    }
+}
+
+impl MathAtlas {
+    /// The picture stored under `key`, marking its page as drawn from in `frame`.
+    fn get(&mut self, frame: u64, key: &str) -> Option<(egui::TextureId, Rect)> {
+        let (page, uv) = *self.uv.get(key)?;
+        let p = self.pages.get_mut(page)?;
+        let id = p.tex.as_ref()?.id();
+        p.used = frame;
+        Some((id, uv))
+    }
+
+    /// Add `img` under `key`; its texture and UV rectangle, or `None` if it can't be placed in
+    /// this frame without wiping pictures already handed out in it.
+    fn add(&mut self, ctx: &egui::Context, frame: u64, key: &str, img: egui::ColorImage) -> Option<(egui::TextureId, Rect)> {
+        let [w, h] = img.size;
+        if w == 0 || h == 0 || w > MATH_ATLAS || h > MATH_ATLAS {
+            return None;
+        }
+        let mut spot = self.pages.iter_mut().enumerate().find_map(|(i, p)| p.place(w, h).map(|at| (i, at)));
+        if spot.is_none() && self.pages.len() < MATH_ATLAS_PAGES {
+            let mut p = AtlasPage::default();
+            spot = p.place(w, h).map(|at| (self.pages.len(), at));
+            self.pages.push(p);
+        }
+        if spot.is_none() {
+            // Every page is full: start over the one drawn from longest ago, unless all of them
+            // were drawn from in this frame.
+            let (i, p) = self.pages.iter_mut().enumerate().filter(|(_, p)| p.used != frame).min_by_key(|(_, p)| p.used)?;
+            p.reset();
+            self.uv.retain(|_, (page, _)| *page != i);
+            self.wipes = self.wipes.saturating_add(1);
+            spot = p.place(w, h).map(|at| (i, at));
+        }
+        let (i, at) = spot?;
+        let p = self.pages.get_mut(i)?;
+        let tex = p.tex.get_or_insert_with(|| {
+            ctx.load_texture(
+                format!("math_atlas_{i}"),
+                egui::ColorImage::filled([MATH_ATLAS, MATH_ATLAS], egui::Color32::TRANSPARENT),
+                egui::TextureOptions::LINEAR,
+            )
+        });
+        tex.set_partial(at, img, egui::TextureOptions::LINEAR);
+        p.used = frame;
+        let s = MATH_ATLAS as f32;
+        let uv = Rect::from_min_max(pos2(at[0] as f32 / s, at[1] as f32 / s), pos2((at[0] + w) as f32 / s, (at[1] + h) as f32 / s));
+        self.uv.insert(key.to_string(), (i, uv));
+        Some((tex.id(), uv))
+    }
 }
 
 impl Previews {
+    /// The font list: installed families, each by its name in the interface language when it has
+    /// one (宋体 for SimSun in Chinese, #505), like Word's.
     pub fn families(&mut self) -> Vec<String> {
-        if self.families.is_none() {
-            let mut f: Vec<String> = wordcraft_fonts::FontDb::global().families().into_iter().filter(|f| !f.starts_with('.')).collect();
+        let lang = crate::i18n::current().code();
+        let generation = wordcraft_fonts::FontDb::global().generation();
+        if self.families.as_ref().is_none_or(|(l, _)| *l != lang) || self.font_gen != generation {
+            self.font_gen = generation;
+            let db = wordcraft_fonts::FontDb::global();
+            let mut f: Vec<String> = db.families_in(lang).into_iter().filter(|f| !f.starts_with('.')).collect();
             for w in [wordcraft_doc::styles::BODY_FONT, wordcraft_doc::styles::HEADING_FONT] {
                 if !f.iter().any(|x| x == w) {
                     f.push(w.to_string());
@@ -33,17 +169,66 @@ impl Previews {
             }
             f.sort_by_key(|a| a.to_lowercase());
             f.dedup();
-            self.families = Some(f);
+            let names = db.localized_names(lang);
+            self.local_names = names.iter().map(|(e, l)| (e.to_lowercase(), l.clone())).collect();
+            self.english_names = names.into_iter().map(|(e, l)| (l, e)).collect();
+            self.families = Some((lang, f));
+            self.east_asian = None;
         }
-        self.families.clone().unwrap_or_default()
+        self.families.as_ref().map(|(_, f)| f.clone()).unwrap_or_default()
+    }
+
+    /// The Font dialog's Asian text font list: the installed Chinese, Japanese and Korean fonts,
+    /// named as in [`Previews::families`].
+    pub fn east_asian_families(&mut self) -> Vec<String> {
+        self.families();
+        if self.east_asian.is_none() {
+            let mut f: Vec<String> = wordcraft_fonts::FontDb::global()
+                .east_asian_families()
+                .into_iter()
+                .filter(|f| !f.starts_with('.'))
+                .map(|f| self.local_names.get(&f.to_lowercase()).cloned().unwrap_or(f))
+                .collect();
+            f.sort_by_key(|a| a.to_lowercase());
+            f.dedup();
+            self.east_asian = Some(f);
+        }
+        self.east_asian.clone().unwrap_or_default()
+    }
+
+    /// The name the font box shows for the document's font `family`: its name in the interface
+    /// language when the font has one.
+    pub fn font_shown(&mut self, family: &str) -> String {
+        self.families();
+        self.local_names.get(&family.to_lowercase()).cloned().unwrap_or_else(|| family.to_string())
+    }
+
+    /// The family name a font chosen in the font box is stored as: the English name for a font
+    /// listed by its localized name (宋体 → SimSun), so the document reads the same anywhere.
+    pub fn font_stored(&mut self, shown: &str) -> String {
+        self.families();
+        self.english_names.get(shown).cloned().unwrap_or_else(|| shown.to_string())
+    }
+
+    /// Fonts were added or removed: list the families again and redraw the entries of
+    /// `families` (an entry drawn before its font was added shows the fallback face).
+    pub fn fonts_changed(&mut self, ctx: &egui::Context, families: impl Iterator<Item = String>) {
+        self.families = None;
+        self.east_asian = None;
+        ctx.data_mut(|d| {
+            for f in families {
+                d.remove::<TextureHandle>(egui::Id::unique(format!("font:{f}")));
+            }
+        });
     }
 
     /// A closure drawing a font-menu entry in its own face.
     pub fn font_preview_fn(&mut self) -> Box<dyn Fn(&mut Ui, &str) -> Response> {
         Box::new(|ui: &mut Ui, name: &str| {
             let key = format!("font:{name}");
-            let tex: Option<TextureHandle> = ui.ctx().data(|d| d.get_temp::<TextureHandle>(egui::Id::new(&key)));
+            let tex: Option<TextureHandle> = ui.ctx().data(|d| d.get_temp::<TextureHandle>(egui::Id::unique(&key)));
             let (r, resp) = ui.allocate_exact_size(vec2(260.0, crate::widgets::COMBO_PREVIEW_ROW_H), Sense::click());
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), name));
             let t = Tokens::get(ui.ctx());
             if resp.hovered() {
                 ui.painter().rect_filled(r, 3.0, t.hover);
@@ -52,7 +237,7 @@ impl Previews {
                 // Context accessors share a lock: read input before taking the data write lock.
                 let now = ui.input(|i| i.time);
                 let n = ui.ctx().data_mut(|d| {
-                    let c = d.get_temp_mut_or_default::<(f64, u32)>(egui::Id::new("font_preview_budget"));
+                    let c = d.get_temp_mut_or_default::<(f64, u32)>(egui::Id::unique("font_preview_budget"));
                     if c.0 != now {
                         *c = (now, 0);
                     }
@@ -64,16 +249,10 @@ impl Previews {
                     return None;
                 }
                 let ppp = ui.ctx().pixels_per_point();
-                let img = snippet(
-                    &Document::new(),
-                    Paragraph::with_text(name, CharProps { font: Some(name.to_string()), size: Some(13.0), ..Default::default() }),
-                    240.0,
-                    20.0,
-                    ppp,
-                    2.0,
-                )?;
+                let mut img = font_entry_image(name, ppp);
+                ink_mask(&mut img);
                 let h = ui.ctx().load_texture(&key, img, egui::TextureOptions::LINEAR);
-                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(&key), h.clone()));
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(&key), h.clone()));
                 Some(h)
             });
             match tex {
@@ -83,7 +262,7 @@ impl Previews {
                         h.id(),
                         Rect::from_min_size(pos2(r.min.x + 6.0, r.center().y - sz.y / 2.0), sz),
                         Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                        t.text,
                     );
                 }
                 None => {
@@ -117,6 +296,11 @@ impl Previews {
         Some(h)
     }
 
+    /// Another document is shown: its revisions count apart from the last one's.
+    pub(crate) fn document_changed(&mut self) {
+        self.styles_hash = (u64::MAX, 0);
+    }
+
     /// Hash of the style sheet (recomputed only when the document revision changes).
     fn styles_key(&mut self, app_doc: &Document, rev: u64) -> u64 {
         if self.styles_hash.0 != rev {
@@ -131,8 +315,9 @@ impl Previews {
 }
 
 /// An equation rasterised for a gallery tile or a button (`pt`: font size; `size`: the tile in
-/// points), with its empty slots shown. Cached by `key`; `None` while waiting for this frame's
-/// rendering budget.
+/// points), with its empty slots shown: the shared texture and the picture's UV rectangle in it
+/// ([`MathAtlas`]). An ink mask, drawn tinted with the theme's text colour. `None` while waiting
+/// for this frame's rendering budget.
 pub fn math_texture(
     app: &mut WordApp,
     ctx: &egui::Context,
@@ -141,10 +326,25 @@ pub fn math_texture(
     display: bool,
     pt: f32,
     size: egui::Vec2,
-) -> Option<TextureHandle> {
+) -> Option<(egui::TextureId, Rect)> {
     let ppp = ctx.pixels_per_point();
     let k = format!("math:{key}:{pt}:{}x{}:{ppp}", size.x, size.y);
-    app.previews.get_or(ctx, &k, || math_image(nodes, display, pt, size.x, size.y, ppp))
+    let p = &mut app.previews;
+    let frame = ctx.cumulative_frame_nr();
+    if let Some(hit) = p.math.get(frame, &k) {
+        return Some(hit);
+    }
+    if frame != p.frame {
+        p.frame = frame;
+        p.budget.set(0);
+    }
+    if p.budget.get() > 8 {
+        ctx.request_repaint();
+        return None;
+    }
+    p.budget.set(p.budget.get() + 1);
+    let img = math_image(nodes, display, pt, size.x, size.y, ppp)?;
+    p.math.add(ctx, frame, &k, img)
 }
 
 fn math_image(nodes: &wordcraft_doc::math::Arg, display: bool, pt: f32, w: f32, h: f32, ppp: f32) -> Option<egui::ColorImage> {
@@ -178,25 +378,68 @@ fn math_image(nodes: &wordcraft_doc::math::Arg, display: bool, pt: f32, w: f32, 
         .unwrap_or(h / 2.0);
     let mut opts = wordcraft_render::RenderOptions::default();
     opts.display.placeholders = true;
-    let img = wordcraft_render::render_area(&d, page, 0.0, mid - h / 2.0, w, h, ppp, &opts);
+    let img = wordcraft_render::render_area(&d, page, wordcraft_geom::Rect::new(0.0, mid - h / 2.0, w, h), ppp, &opts);
     let px = img.to_straight();
-    Some(egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &px))
+    let mut out = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &px);
+    // An ink mask, tinted with the theme's text colour when drawn, so the pictures read on dark tiles (#817).
+    ink_mask(&mut out);
+    Some(out)
+}
+
+/// Turn a snippet rendered black on white paper into an ink mask: white whose alpha is the ink's
+/// coverage, on a transparent background. Painted with the theme's text colour as the tint, a font
+/// menu entry then reads like the rest of the menu in light and dark mode instead of sitting on a
+/// white strip (#535).
+pub fn ink_mask(img: &mut egui::ColorImage) {
+    for p in &mut img.pixels {
+        let [r, g, b, a] = p.to_srgba_unmultiplied();
+        let lum = (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000;
+        let ink = 255u32.saturating_sub(lum.min(255)) * u32::from(a) / 255;
+        *p = egui::Color32::from_white_alpha(u8::try_from(ink).unwrap_or(u8::MAX));
+    }
+}
+
+/// A font list entry: `name` in its own face, 240×20 pt. The face is read for the preview alone
+/// and dropped (#848): browsing the list used to load every family shown for good, so each trip
+/// through the Font box grew memory by tens of megabytes. A name the font has no glyphs for (a
+/// symbol font's), or a font that can't be read, shows in the default face.
+pub fn font_entry_image(name: &str, ppp: f32) -> egui::ColorImage {
+    let db = wordcraft_fonts::FontDb::global();
+    let face = db
+        .preview_face(name)
+        .filter(|f| name.chars().filter(|c| !c.is_whitespace()).all(|c| f.covers(c)))
+        .unwrap_or_else(|| db.face(wordcraft_fonts::FALLBACK_FAMILY, "Regular"));
+    let img = wordcraft_render::render_text_line(&face, name, 13.0, 244.0, 22.0, 2.0, ppp);
+    egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.to_straight())
 }
 
 /// Lay out `para` (with `base`'s styles) in a `w`×`h` pt box and rasterise it.
 pub fn snippet(base: &Document, para: Paragraph, w: f32, h: f32, ppp: f32, margin: f32) -> Option<egui::ColorImage> {
-    snippet_blocks(base, vec![Block::Para(para)], w, h, ppp, margin, None)
+    snippet_blocks(base, vec![Block::Para(para)], SnippetOptions { width: w, height: h, pixels_per_point: ppp, margin, paper: None, dark: false })
 }
 
-fn snippet_blocks(
-    base: &Document,
-    blocks: Vec<Block>,
-    w: f32,
-    h: f32,
-    ppp: f32,
+/// [`snippet`] on the dark page of View › Switch Modes when `dark` (the Styles gallery, #663).
+pub fn style_snippet(base: &Document, para: Paragraph, w: f32, h: f32, ppp: f32, margin: f32, dark: bool) -> Option<egui::ColorImage> {
+    snippet_blocks(base, vec![Block::Para(para)], SnippetOptions { width: w, height: h, pixels_per_point: ppp, margin, paper: None, dark })
+}
+
+/// How a gallery draws a page preview: as rendered on a light interface or on Switch Modes' dark
+/// page, and dimmed in the dark theme so a white page isn't the brightest thing on screen (#663).
+pub fn preview_tint(t: &Tokens, dark_page: bool) -> egui::Color32 {
+    if t.dark && !dark_page { egui::Color32::from_gray(0xC8) } else { egui::Color32::WHITE }
+}
+
+struct SnippetOptions {
+    width: f32,
+    height: f32,
+    pixels_per_point: f32,
     margin: f32,
     paper: Option<wordcraft_doc::Rgb>,
-) -> Option<egui::ColorImage> {
+    dark: bool,
+}
+
+fn snippet_blocks(base: &Document, blocks: Vec<Block>, options: SnippetOptions) -> Option<egui::ColorImage> {
+    let SnippetOptions { width: w, height: h, pixels_per_point: ppp, margin, paper, dark } = options;
     let mut d = Document::new();
     d.styles = base.styles.clone();
     d.numbering = base.numbering.clone();
@@ -213,7 +456,8 @@ fn snippet_blocks(
     if let Some(p) = paper {
         opts.paper = p;
     }
-    let img = wordcraft_render::render_area(&d, page, 0.0, 0.0, w + 2.0 * margin, h + margin, ppp, &opts);
+    opts.dark = dark;
+    let img = wordcraft_render::render_area(&d, page, wordcraft_geom::Rect::new(0.0, 0.0, w + 2.0 * margin, h + margin), ppp, &opts);
     let px = img.to_straight();
     Some(egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &px))
 }
@@ -223,7 +467,7 @@ fn snippet_blocks(
 pub fn style_preview(app: &mut WordApp, ui: &mut Ui, id: &str, ty: &str, size: egui::Vec2) {
     let t = Tokens::get(ui.ctx());
     let (r, _) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter().rect(r, 3.0, egui::Color32::WHITE, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+    ui.painter().rect(r, 3.0, preview_tint(&t, false), Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
     let rev = app.session.rev();
     let skey = app.previews.styles_key(&app.session.doc, rev);
     let ppp = ui.ctx().pixels_per_point();
@@ -257,15 +501,19 @@ pub fn style_preview(app: &mut WordApp, ui: &mut Ui, id: &str, ty: &str, size: e
                 Block::Para(p)
             }
         };
-        snippet_blocks(doc, vec![block], w, h, ppp, 4.0, None)
+        snippet_blocks(doc, vec![block], SnippetOptions { width: w, height: h, pixels_per_point: ppp, margin: 4.0, paper: None, dark: false })
     });
     if let Some(hd) = tex {
         let sz = hd.size_vec2() / ppp;
         let ir = Rect::from_min_size(pos2(r.min.x + 2.0, r.min.y + 2.0), sz.min(r.size() - vec2(4.0, 4.0)));
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2((ir.width() / sz.x).min(1.0), (ir.height() / sz.y).min(1.0)));
-        ui.painter().with_clip_rect(r).image(hd.id(), ir, uv, egui::Color32::WHITE);
+        ui.painter().with_clip_rect(r).image(hd.id(), ir, uv, preview_tint(&t, false));
     }
 }
+
+/// Tiles the Home tab's Styles gallery shows, as designed and in a compact group.
+const STYLE_TILES: usize = 6;
+const STYLE_TILES_COMPACT: usize = 3;
 
 /// The Home tab's Styles gallery.
 pub fn style_gallery(app: &mut WordApp, ui: &mut Ui, state: &Value) {
@@ -275,21 +523,26 @@ pub fn style_gallery(app: &mut WordApp, ui: &mut Ui, state: &Value) {
     let rev = app.session.rev();
     let skey = app.previews.styles_key(&app.session.doc, rev);
     let ppp = ui.ctx().pixels_per_point();
-    let start = ui.data(|d| d.get_temp::<usize>(egui::Id::new("gallery_start"))).unwrap_or(0).min(styles.len().saturating_sub(1));
-    let visible = 6usize;
+    let start_id = app.window_id("gallery_start");
+    let start = ui.data(|d| d.get_temp::<usize>(start_id)).unwrap_or(0).min(styles.len().saturating_sub(1));
+    // A compact ribbon group (#662, #1285) trims the gallery to fewer tiles before it folds.
+    let visible = if crate::ribbon_fit::compact(ui.ctx()) { STYLE_TILES_COMPACT } else { STYLE_TILES };
+    crate::ribbon_fit::add_saving(ui.ctx(), (STYLE_TILES - STYLE_TILES_COMPACT) as f32 * 76.0);
     let (area, _) = ui.allocate_exact_size(vec2(visible as f32 * 76.0 + 18.0, crate::widgets::CONTENT_H), Sense::hover());
     ui.painter().rect(area.shrink(1.0), 4.0, t.input, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
     for (k, (id, name)) in styles.iter().skip(start).take(visible).enumerate() {
         let r = Rect::from_min_size(pos2(area.min.x + 3.0 + k as f32 * 76.0, area.min.y + 3.0), vec2(74.0, area.height() - 6.0));
-        let resp = ui.interact(r, ui.id().with(("style_tile", id)), Sense::click());
+        let resp = ui.interact(r, ui.scope_id().with(("style_tile", id)), Sense::click());
         let active = *id == current;
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, active, name));
         if active {
             ui.painter().rect(r, 3.0, t.checked, Stroke::new(1.0, t.accent), egui::StrokeKind::Inside);
         } else if resp.hovered() {
             ui.painter().rect_filled(r, 3.0, t.hover);
         }
         let lang = crate::i18n::current().code();
-        let key = format!("style:{id}:{skey}:{ppp}:{lang}");
+        let dark_page = app.session.view.dark_mode;
+        let key = format!("style:{id}:{skey}:{ppp}:{lang}:{dark_page}");
         let doc = &app.session.doc;
         let tex = app.previews.get_or(ui.ctx(), &key, || {
             // Sample letters in the interface's script (`АаБбВвГг` in Russian).
@@ -301,19 +554,30 @@ pub fn style_gallery(app: &mut WordApp, ui: &mut Ui, state: &Value) {
             p.props.indent_left = Some(if first.is_finite() { (-first).max(0.0) } else { 0.0 });
             p.props.borders = None;
             p.props.shading = None;
-            snippet(doc, p, 220.0, 30.0, ppp, 1.0)
+            style_snippet(doc, p, 220.0, 30.0, ppp, 1.0, dark_page)
         });
         if let Some(h) = tex {
             let sz = h.size_vec2() / ppp;
             let ir = Rect::from_min_size(pos2(r.min.x + 3.0, r.min.y + 4.0), sz.min(vec2(68.0, 32.0)));
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2((ir.width() / sz.x).min(1.0), (ir.height() / sz.y).min(1.0)));
-            ui.painter().with_clip_rect(r).image(h.id(), ir, uv, egui::Color32::WHITE);
+            ui.painter().with_clip_rect(r).image(h.id(), ir, uv, preview_tint(&t, dark_page));
         }
         let mut job = egui::text::LayoutJob::single_section(name.clone(), egui::TextFormat::simple(regular(10.5), t.text));
         job.wrap = egui::text::TextWrapping::truncate_at_width(r.width() - 6.0);
         let galley = ui.painter().layout_job(job);
         let label_pos = pos2(r.center().x - galley.size().x / 2.0, r.max.y - 9.0 - galley.size().y / 2.0);
         ui.painter().with_clip_rect(r).galley(label_pos, galley, t.text);
+        // Right-click a tile: the same style actions as the Styles pane.
+        resp.context_menu(|ui| {
+            if ui.button(tl!("Update to Match Selection")).clicked() {
+                let _ = app.run("styles.updateToMatch", json!({"style": id}));
+                ui.close();
+            }
+            if ui.button(tl!("Modify…")).clicked() {
+                app.dialog = crate::dialogs::Dialog::modify_style(app, id);
+                ui.close();
+            }
+        });
         if resp.on_hover_text(name).clicked() {
             let _ = app.run("para.style", json!({"style": id}));
         }
@@ -323,7 +587,7 @@ pub fn style_gallery(app: &mut WordApp, ui: &mut Ui, state: &Value) {
     let thirds = ar.height() / 3.0;
     for (i, (icon, delta)) in [("chevronUp", -1i32), ("chevronDown", 1), ("more", 0)].iter().enumerate() {
         let br = Rect::from_min_size(pos2(ar.min.x, ar.min.y + thirds * i as f32), vec2(ar.width(), thirds));
-        let resp = ui.interact(br, ui.id().with(("gal_arrow", i)), Sense::click());
+        let resp = ui.interact(br, ui.scope_id().with(("gal_arrow", i)), Sense::click());
         if resp.hovered() {
             ui.painter().rect_filled(br, 2.0, t.hover);
         }
@@ -333,18 +597,25 @@ pub fn style_gallery(app: &mut WordApp, ui: &mut Ui, state: &Value) {
                 let _ = app.run("view.stylesPane", json!({"value": true}));
             } else {
                 let n = if *delta < 0 { start.saturating_sub(visible) } else { (start + visible).min(styles.len().saturating_sub(1)) };
-                ui.data_mut(|d| d.insert_temp(egui::Id::new("gallery_start"), n));
+                ui.data_mut(|d| d.insert_temp(start_id, n));
             }
         }
     }
 }
 
+/// Style sets shown in the Design tab's gallery, in order.
+const STYLE_SETS: [&str; 7] = ["default", "basic", "lines", "shaded", "casual", "centered", "minimalist"];
+/// Width of one gallery thumbnail, points.
+const STYLE_SET_W: f32 = 56.0;
+/// Width the whole gallery takes with the ribbon's 1 pt item spacing.
+pub const STYLE_SET_GALLERY_W: f32 = STYLE_SETS.len() as f32 * (STYLE_SET_W + 1.0) - 1.0;
+
 /// Design tab: style set tiles.
 pub fn style_set_gallery(app: &mut WordApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let ppp = ui.ctx().pixels_per_point();
-    for name in ["default", "basic", "lines", "shaded", "casual", "centered", "minimalist"] {
-        let (r, resp) = ui.allocate_exact_size(vec2(56.0, crate::widgets::CONTENT_H), Sense::click());
+    for name in STYLE_SETS {
+        let (r, resp) = ui.allocate_exact_size(vec2(STYLE_SET_W, crate::widgets::CONTENT_H), Sense::click());
         if resp.hovered() {
             ui.painter().rect_filled(r, 3.0, t.hover);
         }
@@ -357,14 +628,18 @@ pub fn style_set_gallery(app: &mut WordApp, ui: &mut Ui) {
                 Block::Para(Paragraph::with_text(tl!("Heading 1"), CharProps::default()).styled("Heading1")),
                 Block::Para(Paragraph::with_text(tl!("Body text in a short paragraph to show spacing."), CharProps::default())),
             ];
-            snippet_blocks(&s.doc, blocks, 120.0, 110.0, ppp * 0.42, 6.0, None)
+            snippet_blocks(
+                &s.doc,
+                blocks,
+                SnippetOptions { width: 120.0, height: 110.0, pixels_per_point: ppp * 0.42, margin: 6.0, paper: None, dark: false },
+            )
         });
         if let Some(h) = tex {
             let sz = h.size_vec2() / ppp;
             let ir = Rect::from_min_size(pos2(r.min.x + 3.0, r.min.y + 3.0), sz.min(vec2(50.0, 60.0)));
             ui.painter().rect_stroke(ir, 0.0, Stroke::new(1.0, t.border), egui::StrokeKind::Outside);
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2((ir.width() / sz.x).min(1.0), (ir.height() / sz.y).min(1.0)));
-            ui.painter().image(h.id(), ir, uv, egui::Color32::WHITE);
+            ui.painter().image(h.id(), ir, uv, preview_tint(&t, false));
         }
         if resp.on_hover_text(format!("Style set: {name}")).clicked() {
             let _ = app.run("design.styleSet", json!({"name": name}));
@@ -392,55 +667,20 @@ pub fn table_style_tile(ui: &mut Ui, app: &mut WordApp, style: &str) -> Response
                 c.blocks = vec![para_block(Paragraph::with_text(" ", CharProps { size: Some(5.0), ..Default::default() }))];
             }
         }
-        snippet_blocks(doc, vec![Block::Table(tb), Block::Para(Paragraph::new())], 104.0, 70.0, ppp * 0.48, 4.0, None)
+        snippet_blocks(
+            doc,
+            vec![Block::Table(tb), Block::Para(Paragraph::new())],
+            SnippetOptions { width: 104.0, height: 70.0, pixels_per_point: ppp * 0.48, margin: 4.0, paper: None, dark: false },
+        )
     });
     if let Some(h) = tex {
         let sz = h.size_vec2() / ppp;
         let ir = Rect::from_center_size(r.center(), sz.min(vec2(54.0, 42.0)));
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2((ir.width() / sz.x).min(1.0), (ir.height() / sz.y).min(1.0)));
-        ui.painter().image(h.id(), ir, uv, egui::Color32::WHITE);
+        ui.painter().image(h.id(), ir, uv, preview_tint(&t, false));
     }
     resp
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn font_menu_previews_render_defer_and_reuse_without_deadlocking() {
-        // A nested Context lock used to hang the first uncached menu entry. Bound the wait so
-        // a regression fails the test instead of hanging the entire test suite.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let ctx = egui::Context::default();
-            let preview = Previews::default().font_preview_fn();
-            let budget_id = egui::Id::new("font_preview_budget");
-            let sans_id = egui::Id::new("font:Source Sans 3");
-            let inter_id = egui::Id::new("font:Inter");
-            ctx.data_mut(|d| d.insert_temp(budget_id, (1.0_f64, 11_u32)));
-
-            for time in [1.0, 2.0, 3.0] {
-                let input = egui::RawInput { time: Some(time), ..Default::default() };
-                ctx.run_ui(input, |ui| {
-                    preview(ui, "Source Sans 3");
-                    preview(ui, "Inter");
-                })
-                .drop_without_applying_deltas();
-                ctx.data(|d| {
-                    assert!(d.get_temp::<TextureHandle>(sans_id).is_some());
-                    if time == 1.0 {
-                        assert!(d.get_temp::<TextureHandle>(inter_id).is_none(), "over-budget entry should defer");
-                        assert_eq!(d.get_temp::<(f64, u32)>(budget_id), Some((1.0, 13)));
-                    } else {
-                        assert!(d.get_temp::<TextureHandle>(inter_id).is_some(), "deferred entry should render next frame");
-                        assert_eq!(d.get_temp::<(f64, u32)>(budget_id), Some((2.0, 1)), "cached entries should not consume budget");
-                    }
-                });
-            }
-            tx.send(()).unwrap();
-        });
-        rx.recv_timeout(std::time::Duration::from_secs(30)).expect("font menu preview rendering hung or failed");
-        worker.join().unwrap();
-    }
-}
+mod tests;

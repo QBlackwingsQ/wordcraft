@@ -1,7 +1,9 @@
 //! Sprms → model properties, and style-chain resolution.
 
 use wordcraft_doc::Rgb;
-use wordcraft_doc::props::{Align, CharProps, Highlight, LineSpacing, ParaProps, TextColor, Underline, VertAlign};
+use wordcraft_doc::props::{
+    Align, Border, BorderStyle, Borders, CharProps, Highlight, LineSpacing, ParaProps, TabAlign, TabLeader, TabStop, TextColor, Underline, VertAlign,
+};
 use wordcraft_doc::styles::{Style, StyleKind, StyleSheet};
 
 use crate::sprm::{self, Prl, Toggle};
@@ -18,7 +20,9 @@ const C_ICO: u16 = 0x2A42; // palette colour
 const C_CR: u16 = 0x6870; // explicit COLORREF
 const C_HPS: u16 = 0x4A43; // half-points
 const C_HPS_POS: u16 = 0x4845; // super/subscript by half-points
-const C_FTC0: u16 = 0x4A4F; // font index
+const C_FTC0: u16 = 0x4A4F; // font index (ASCII)
+const C_FTC1: u16 = 0x4A50; // East Asian font index (sprmCRgFtc1)
+const C_FTC_BI: u16 = 0x4A5E; // complex-script font index (sprmCFtcBi)
 const C_HIGHLIGHT: u16 = 0x2A0C;
 const C_ISTD: u16 = 0x4A30; // character style
 
@@ -30,6 +34,11 @@ const P_DXA_LEFT80: u16 = 0x840F;
 const P_DXA_RIGHT: u16 = 0x845D;
 const P_DXA_RIGHT80: u16 = 0x840E;
 const P_DXA_FIRST: u16 = 0x8460; // sprmPDxaLeft1
+const P_DXA_FIRST80: u16 = 0x8411; // sprmPDxaLeft1_80
+// Indents in hundredths of a character (sprmPDxcRight, sprmPDxcLeft, sprmPDxcLeft1).
+const P_DXC_RIGHT: u16 = 0x4455;
+const P_DXC_LEFT: u16 = 0x4456;
+const P_DXC_FIRST: u16 = 0x4457;
 const P_DYA_BEFORE: u16 = 0xA413;
 const P_DYA_AFTER: u16 = 0xA414;
 const P_DYA_LINE: u16 = 0x6412;
@@ -37,6 +46,18 @@ const P_KEEP: u16 = 0x2405; // keep lines together
 const P_KEEP_FOLLOW: u16 = 0x2406; // keep with next
 const P_PAGE_BREAK_BEFORE: u16 = 0x2407;
 const P_OUTLVL: u16 = 0x2640;
+// Paragraph borders ([MS-DOC] §2.6.2). The 80 forms carry a Brc80 (palette colour), the
+// newer ones a BrcOperand: cb(1) + Brc(8, with a full COLORREF).
+const P_BRC_TOP80: u16 = 0x6424;
+const P_BRC_LEFT80: u16 = 0x6425;
+const P_BRC_BOTTOM80: u16 = 0x6426;
+const P_BRC_RIGHT80: u16 = 0x6427;
+const P_BRC_BETWEEN80: u16 = 0x6428;
+const P_BRC_TOP: u16 = 0xC64E;
+const P_BRC_LEFT: u16 = 0xC64F;
+const P_BRC_BOTTOM: u16 = 0xC650;
+const P_BRC_RIGHT: u16 = 0xC651;
+const P_BRC_BETWEEN: u16 = 0xC652;
 
 /// Word's 16-colour `Ico` palette ([MS-DOC] §2.9.135), 0 = automatic.
 const ICO: [Rgb; 17] = [
@@ -86,6 +107,69 @@ pub(crate) fn ico(i: u8) -> Option<Rgb> {
         return None;
     }
     ICO.get(i as usize).copied()
+}
+
+/// The model border style a `brcType` stands for ([MS-DOC] §2.9.22 BrcType). Types the model
+/// doesn't carry (the gap variants, 3-D, inset/outset) draw as single lines, as the DOCX
+/// reader maps them.
+fn brc_style(t: u8) -> BorderStyle {
+    match t {
+        0x00 => BorderStyle::None,
+        0x03 => BorderStyle::Double,
+        0x06 => BorderStyle::Dotted,
+        0x07 | 0x16 => BorderStyle::Dashed,
+        0x08 | 0x09 => BorderStyle::DotDash,
+        0x0A => BorderStyle::Triple,
+        0x14 | 0x15 => BorderStyle::Wave,
+        _ => BorderStyle::Single,
+    }
+}
+
+/// The border width in points: `dptLineWidth` in 1/8-point steps (values below 2 count as 2;
+/// 1-point steps for page borders, which never reach a paragraph property).
+fn brc_width(t: u8, dpt: u8) -> f32 {
+    if t >= 0x40 { f32::from(dpt) } else { f32::from(dpt.max(2)) / 8.0 }
+}
+
+/// One border from a Brc80 operand ([MS-DOC] §2.9.18). All bits set means "no border"; a
+/// truncated operand is ignored.
+fn brc80(op: &[u8]) -> Option<Border> {
+    let [dpt, ty, ico_index, tail, ..] = op else { return None };
+    if [*dpt, *ty, *ico_index, *tail] == [0xFF; 4] {
+        return Some(Border::default());
+    }
+    Some(Border { style: brc_style(*ty), width: brc_width(*ty, *dpt), color: ico(*ico_index), space: f32::from(tail & 0x1F) })
+}
+
+/// One border from a `BrcOperand` ([MS-DOC] §2.9.21): cb(1, MUST be 8) + Brc(8).
+fn brc(op: &[u8]) -> Option<Border> {
+    if op.first() != Some(&8) {
+        return None;
+    }
+    let b = op.get(1..9)?;
+    if b.iter().all(|x| *x == 0xFF) {
+        return Some(Border::default());
+    }
+    let color = match b.get(..4) {
+        Some([0, 0, 0, 0]) => None, // automatic
+        Some(px) => Some(Rgb(px[0], px[1], px[2])),
+        None => None,
+    };
+    Some(Border { style: brc_style(b[5]), width: brc_width(b[5], b[4]), color, space: f32::from(b[6] & 0x1F) })
+}
+
+/// Put a decoded border on the side its sprm names (`between` = the border between this
+/// paragraph and the next).
+fn set_border(p: &mut ParaProps, op: u16, b: Border) {
+    let borders = p.borders.get_or_insert_with(Borders::default);
+    let slot = match op {
+        P_BRC_TOP80 | P_BRC_TOP => &mut borders.top,
+        P_BRC_LEFT80 | P_BRC_LEFT => &mut borders.left,
+        P_BRC_BOTTOM80 | P_BRC_BOTTOM => &mut borders.bottom,
+        P_BRC_RIGHT80 | P_BRC_RIGHT => &mut borders.right,
+        _ => &mut borders.between,
+    };
+    *slot = Some(b);
 }
 
 fn u16_of(p: &Prl) -> Option<u16> {
@@ -172,6 +256,16 @@ pub(crate) fn apply_char(p: &mut CharProps, prl: &Prl, base: &CharProps, fonts: 
                 p.font = Some(name.clone());
             }
         }
+        C_FTC1 => {
+            if let Some(name) = u16_of(prl).and_then(|i| fonts.get(i as usize)) {
+                p.font_ea = Some(name.clone());
+            }
+        }
+        C_FTC_BI => {
+            if let Some(name) = u16_of(prl).and_then(|i| fonts.get(i as usize)) {
+                p.font_cs = Some(name.clone());
+            }
+        }
         C_HIGHLIGHT => {
             if let Some(h) = HL.get(prl.operand.first().copied().unwrap_or(0) as usize) {
                 p.highlight = Some(*h);
@@ -182,17 +276,63 @@ pub(crate) fn apply_char(p: &mut CharProps, prl: &Prl, base: &CharProps, fonts: 
     }
 }
 
+/// Custom tab stops from `sprmPChgTabsPapx` / `sprmPChgTabs` ([MS-DOC] PChgTabsPapxOperand,
+/// PChgTabsOperand): the stops removed become `Clear` stops (they hide inherited ones) and the
+/// stops added carry their alignment and leader (TBD: jc in bits 0–2, tlc in bits 3–5).
+fn change_tabs(p: &mut ParaProps, prl: &Prl) {
+    let op = prl.operand;
+    let i16_at = |i: usize| op.get(i..i + 2).map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 20.0);
+    // Both operands start with cb; sprmPChgTabs's removals also carry a "close" distance each.
+    let close = prl.op == sprm::P_CHG_TABS;
+    let mut at = 1;
+    let Some(&del) = op.get(at) else { return };
+    let del = usize::from(del.min(64));
+    at += 1;
+    let mut removed = Vec::with_capacity(del);
+    for k in 0..del {
+        if let Some(x) = i16_at(at + 2 * k) {
+            removed.push(x);
+        }
+    }
+    at += 2 * del * if close { 2 } else { 1 };
+    let Some(&add) = op.get(at) else { return };
+    let add = usize::from(add.min(64));
+    at += 1;
+    let mut tabs = p.tabs.take().unwrap_or_default();
+    // Removed within 25 twips (1.25 pt), as the format says.
+    tabs.retain(|t| !removed.iter().any(|x| (t.pos - x).abs() <= 1.25));
+    for x in removed {
+        tabs.push(TabStop { pos: x, align: TabAlign::Clear, leader: TabLeader::None });
+    }
+    for k in 0..add {
+        let (Some(pos), Some(&tbd)) = (i16_at(at + 2 * k), op.get(at + 2 * add + k)) else { break };
+        let align = match tbd & 7 {
+            1 => TabAlign::Center,
+            2 => TabAlign::Right,
+            3 => TabAlign::Decimal,
+            4 => TabAlign::Bar,
+            _ => TabAlign::Left,
+        };
+        let leader = match (tbd >> 3) & 7 {
+            1 => TabLeader::Dot,
+            2 => TabLeader::Hyphen,
+            3 | 4 => TabLeader::Underscore,
+            5 => TabLeader::MiddleDot,
+            _ => TabLeader::None,
+        };
+        tabs.retain(|t| (t.pos - pos).abs() > 0.05);
+        tabs.push(TabStop { pos, align, leader });
+    }
+    tabs.sort_by(|a, b| a.pos.total_cmp(&b.pos));
+    p.tabs = Some(tabs);
+}
+
 /// Apply a paragraph-property sprm.
 pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
     let tw = |v: i32| (v as f32 / 20.0).clamp(-1000.0, 1000.0);
     let s16 = |prl: &Prl| -> Option<i16> { u16_of(prl).map(|v| v as i16) };
-    let i32of = |prl: &Prl| -> Option<i32> {
-        match prl.operand {
-            [b0, b1, b2, b3, ..] => Some(i32::from_le_bytes([*b0, *b1, *b2, *b3])),
-            _ => None,
-        }
-    };
     match prl.op {
+        sprm::P_CHG_TABS | sprm::P_CHG_TABS_PAPX => change_tabs(p, prl),
         P_JC | P_JC80 => {
             p.align = match prl.operand.first().copied().unwrap_or(0) {
                 1 => Some(Align::Center),
@@ -212,9 +352,20 @@ pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
                 p.indent_right = Some(tw(v as i32));
             }
         }
-        P_DXA_FIRST => {
-            if let Some(v) = i32of(prl) {
-                p.indent_first = Some(tw(v));
+        // A two-byte operand, like the other indents (spra 4).
+        P_DXA_FIRST | P_DXA_FIRST80 => {
+            if let Some(v) = s16(prl) {
+                p.indent_first = Some(tw(v as i32));
+            }
+        }
+        P_DXC_RIGHT | P_DXC_LEFT | P_DXC_FIRST => {
+            if let Some(v) = s16(prl) {
+                let chars = Some(f32::from(v) / 100.0);
+                match prl.op {
+                    P_DXC_RIGHT => p.indent_right_chars = chars,
+                    P_DXC_LEFT => p.indent_left_chars = chars,
+                    _ => p.indent_first_chars = chars,
+                }
             }
         }
         P_DYA_BEFORE => {
@@ -227,13 +378,18 @@ pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
                 p.space_after = Some((v as f32 / 20.0).clamp(0.0, 3168.0));
             }
         }
+        // LSPD ([MS-DOC] §2.9.150): a signed dyaLine, then fMultLinespace. In lines (240ths) when
+        // fMultLinespace is 1; else twips, at least when positive and exactly when negative.
         P_DYA_LINE => {
-            if let Some(v) = u16_of(prl) {
-                let mult = (v & 0x3FFF) as f32;
-                p.line_spacing = Some(match v & 0xC000 {
-                    0x0000 => LineSpacing::Multiple((mult / 240.0).clamp(0.1, 20.0)),
-                    0x8000 => LineSpacing::AtLeast((mult / 20.0).clamp(0.0, 1584.0)),
-                    _ => LineSpacing::Exactly((mult / 20.0).clamp(0.0, 1584.0)),
+            if let Some(v) = s16(prl) {
+                let mult = prl.operand.get(2..4).is_some_and(|b| b == [1, 0]);
+                let v = f32::from(v);
+                p.line_spacing = Some(if mult {
+                    LineSpacing::Multiple((v.abs() / 240.0).clamp(0.06, 132.0))
+                } else if v < 0.0 {
+                    LineSpacing::Exactly((-v / 20.0).clamp(0.7, 1584.0))
+                } else {
+                    LineSpacing::AtLeast((v / 20.0).clamp(0.0, 1584.0))
                 });
             }
         }
@@ -257,16 +413,31 @@ pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
                 p.outline_level = Some(l.min(8));
             }
         }
+        P_BRC_TOP80 | P_BRC_LEFT80 | P_BRC_BOTTOM80 | P_BRC_RIGHT80 | P_BRC_BETWEEN80 => {
+            if let Some(b) = brc80(prl.operand) {
+                set_border(p, prl.op, b);
+            }
+        }
+        P_BRC_TOP | P_BRC_LEFT | P_BRC_BOTTOM | P_BRC_RIGHT | P_BRC_BETWEEN => {
+            if let Some(b) = brc(prl.operand) {
+                set_border(p, prl.op, b);
+            }
+        }
         _ => {}
     }
 }
 
 /// Build the model stylesheet: resolve each raw style's chain (base → this) and the ids we
 /// reference from paragraphs.
-pub(crate) fn stylesheet(raw: &[crate::stsh::RawStyle], fonts: &[String]) -> StyleSheet {
+pub(crate) fn stylesheet(raw: &[crate::stsh::RawStyle], fonts: &[String], standard: crate::stsh::StandardFonts) -> StyleSheet {
     let mut sheet = StyleSheet::empty();
-    // Word's base character properties: font index 0 of the table, 10 pt ([MS-DOC] sprmCHps).
-    sheet.default_chr.font = fonts.first().cloned();
+    // Word's base character properties: the stylesheet's standard fonts (Aptos in a Word 365
+    // file, whose font table still starts with Times New Roman, #5066), else font index 0 of the
+    // table; 10 pt ([MS-DOC] sprmCHps).
+    let font = |i: Option<u16>| i.and_then(|i| fonts.get(usize::from(i))).cloned();
+    sheet.default_chr.font = font(standard.ascii).or_else(|| fonts.first().cloned());
+    sheet.default_chr.font_ea = font(standard.east_asian);
+    sheet.default_chr.font_cs = font(standard.bidi);
     if sheet.default_chr.size.is_none() {
         sheet.default_chr.size = Some(10.0);
     }

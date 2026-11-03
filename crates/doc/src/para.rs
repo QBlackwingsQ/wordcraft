@@ -13,596 +13,15 @@ use crate::props::{CharProps, ParaProps};
 use crate::section::SectionProps;
 use crate::{DocError, Result};
 
-/// Object replacement character: marks an inline object in paragraph text.
-pub const OBJ: char = '\u{FFFC}';
-/// Manual line break (Shift+Enter).
-pub const LINE_BREAK: char = '\n';
-/// Page break (Ctrl+Enter).
-pub const PAGE_BREAK: char = '\u{000C}';
-/// Column break (Ctrl+Shift+Enter).
-pub const COLUMN_BREAK: char = '\u{000E}';
-/// Optional hyphen (Ctrl+-).
-pub const SOFT_HYPHEN: char = '\u{00AD}';
-/// Nonbreaking hyphen (Ctrl+Shift+-).
-pub const NB_HYPHEN: char = '\u{2011}';
-/// Nonbreaking space (Ctrl+Shift+Space).
-pub const NBSP: char = '\u{00A0}';
+mod float;
+mod inline_kinds;
+mod inline_object;
+mod run;
 
-static REV: AtomicU64 = AtomicU64::new(1);
-
-/// A fresh revision number (process-unique), used by layout caches to detect edits.
-pub fn next_rev() -> u64 {
-    REV.fetch_add(1, Ordering::Relaxed)
-}
-
-/// A formatting run: `len` bytes of text sharing `props`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Run {
-    pub len: usize,
-    #[serde(default, skip_serializing_if = "CharProps::is_empty")]
-    pub props: CharProps,
-}
-
-/// How a floating object is placed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub enum Wrap {
-    /// In line with text (not floating).
-    #[default]
-    Inline,
-    Square,
-    Tight,
-    Through,
-    TopAndBottom,
-    BehindText,
-    InFrontOfText,
-}
-
-/// Which sides of a Square, Tight or Through object text may flow on (`@wrapText`, ECMA-376
-/// Part 1, §20.4.3.7 `ST_WrapText`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub enum WrapText {
-    /// Both sides of the object.
-    #[default]
-    BothSides,
-    /// Only the left side: the band to the object's right stays empty.
-    Left,
-    /// Only the right side.
-    Right,
-    /// Only whichever side has more room, decided per line.
-    Largest,
-}
-
-impl WrapText {
-    /// From the OOXML value (`bothSides`, `left`, `right`, `largest`).
-    pub fn from_ooxml(v: &str) -> Option<WrapText> {
-        match v {
-            "bothSides" => Some(WrapText::BothSides),
-            "left" => Some(WrapText::Left),
-            "right" => Some(WrapText::Right),
-            "largest" => Some(WrapText::Largest),
-            _ => None,
-        }
-    }
-
-    /// The OOXML value.
-    pub fn ooxml(self) -> &'static str {
-        match self {
-            WrapText::BothSides => "bothSides",
-            WrapText::Left => "left",
-            WrapText::Right => "right",
-            WrapText::Largest => "largest",
-        }
-    }
-
-    pub fn is_both(&self) -> bool {
-        *self == WrapText::BothSides
-    }
-}
-
-/// What a floating object's offset is relative to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub enum Anchor {
-    #[default]
-    Column,
-    Margin,
-    Page,
-    Paragraph,
-    /// The page's left margin area (from the page's left edge to the text).
-    LeftMargin,
-    /// The page's right margin area (from the text to the page's right edge).
-    RightMargin,
-    /// The page's top margin area (from the page's top edge to the text).
-    TopMargin,
-    /// The page's bottom margin area (from the text to the page's bottom edge).
-    BottomMargin,
-    /// The inside margin (left on odd pages, right on even pages when mirrored).
-    InsideMargin,
-    /// The outside margin.
-    OutsideMargin,
-    /// The anchor character (horizontal only).
-    Character,
-    /// The anchor line (vertical only).
-    Line,
-}
-
-/// Alignment of a floating object within its [`Anchor`] area, instead of an offset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum FloatAlign {
-    /// Left or top.
-    Start,
-    Center,
-    /// Right or bottom.
-    End,
-    Inside,
-    Outside,
-}
-
-impl FloatAlign {
-    /// From an OOXML alignment (`wp:align`, `w:tblpXSpec`, `w:tblpYSpec`).
-    pub fn from_ooxml(v: &str) -> Option<FloatAlign> {
-        match v {
-            "left" | "top" => Some(FloatAlign::Start),
-            "center" => Some(FloatAlign::Center),
-            "right" | "bottom" => Some(FloatAlign::End),
-            "inside" => Some(FloatAlign::Inside),
-            "outside" => Some(FloatAlign::Outside),
-            _ => None,
-        }
-    }
-
-    /// The OOXML name on the horizontal (`left`, `right`) or vertical (`top`, `bottom`) axis.
-    pub fn ooxml(self, horizontal: bool) -> &'static str {
-        match (self, horizontal) {
-            (FloatAlign::Start, true) => "left",
-            (FloatAlign::Start, false) => "top",
-            (FloatAlign::Center, _) => "center",
-            (FloatAlign::End, true) => "right",
-            (FloatAlign::End, false) => "bottom",
-            (FloatAlign::Inside, _) => "inside",
-            (FloatAlign::Outside, _) => "outside",
-        }
-    }
-}
-
-/// Floating placement (ignored when `wrap` is `Inline`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
-#[serde(default, rename_all = "camelCase")]
-pub struct Float {
-    pub wrap: Wrap,
-    /// The sides text wraps on (Square, Tight and Through).
-    #[serde(skip_serializing_if = "WrapText::is_both")]
-    pub wrap_text: WrapText,
-    pub h_rel: Anchor,
-    pub v_rel: Anchor,
-    /// Offsets, points (used when the matching alignment is `None`).
-    pub x: f32,
-    pub y: f32,
-    /// Alignments within the anchor area; they take precedence over the offsets.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub h_align: Option<FloatAlign>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub v_align: Option<FloatAlign>,
-    /// Distance from surrounding text at the left and right (points).
-    pub dist: f32,
-    /// Distance from surrounding text above and below (points).
-    pub dist_top: f32,
-    pub dist_bottom: f32,
-    /// Room around the object for effects such as shadows (left, top, right, bottom, points),
-    /// inline or floating: lines and surrounding text keep clear of it. Rotation's own overhang
-    /// is not in here: it follows from [`Float::rot`] (see [`Float::spin_pad`]).
-    pub effect: [f32; 4],
-    /// Rotation clockwise about the object's centre, degrees (DrawingML `a:xfrm/@rot`). Offsets
-    /// and the size stay those of the unrotated frame, as in Word; see [`Float::spin`].
-    #[serde(skip_serializing_if = "is_zero")]
-    pub rot: f32,
-    /// Mirrored left to right / top to bottom (`a:xfrm/@flipH`, `@flipV`).
-    #[serde(skip_serializing_if = "is_false")]
-    pub flip_h: bool,
-    #[serde(skip_serializing_if = "is_false")]
-    pub flip_v: bool,
-    /// The outline Tight and Through wrapping follow (`wp:wrapPolygon`), in the object's own
-    /// (unrotated) frame; `None` = derived from the object (see [`crate::wrap`]).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wrap_polygon: Option<std::sync::Arc<crate::wrap::WrapPolygon>>,
-}
-
-fn is_zero(v: &f32) -> bool {
-    *v == 0.0
-}
-fn is_false(v: &bool) -> bool {
-    !*v
-}
-
-impl Float {
-    /// The rotation and flips, the angle normalised to `0..360` (a NaN angle is no rotation).
-    pub fn spin(&self) -> wordcraft_geom::Spin {
-        wordcraft_geom::Spin::new(self.rot, self.flip_h, self.flip_v)
-    }
-    /// Set the rotation and flips (the angle normalised).
-    pub fn set_spin(&mut self, s: wordcraft_geom::Spin) {
-        self.rot = wordcraft_geom::normalize_degrees(s.deg);
-        self.flip_h = s.flip_h;
-        self.flip_v = s.flip_v;
-    }
-    /// How far a `w` × `h` frame's rotated bounds reach past it on each side (x, y): the room a
-    /// rotated object takes beyond its frame (zero unrotated; negative where the turned object
-    /// is narrower than its frame, as a wide picture turned 90° is).
-    pub fn spin_pad(&self, w: f32, h: f32) -> (f32, f32) {
-        let (w, h) = (wordcraft_geom::finite(w).clamp(0.0, 4000.0), wordcraft_geom::finite(h).clamp(0.0, 4000.0));
-        let (bw, bh) = self.spin().extent(w, h);
-        ((bw - w) / 2.0, (bh - h) / 2.0)
-    }
-    /// The effect extents, finite and clamped (left, top, right, bottom).
-    pub fn effect_extent(&self) -> [f32; 4] {
-        self.effect.map(|v| if v.is_finite() { v.clamp(0.0, 1584.0) } else { 0.0 })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub enum ShapeKind {
-    #[default]
-    Rectangle,
-    RoundedRectangle,
-    Ellipse,
-    Triangle,
-    Diamond,
-    Line,
-    Arrow,
-    Star,
-    Heart,
-    /// A text box (rectangle with a text story).
-    TextBox,
-    /// A shape drawn point by point, such as ink (its geometry is the shape's `freeform`).
-    Freeform,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub enum NoteKind {
-    #[default]
-    Footnote,
-    Endnote,
-}
-
-/// How ruby (phonetic guide) text lines up over its base text (ECMA-376 `ST_RubyAlign`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub enum RubyAlign {
-    #[default]
-    Center,
-    /// Letters spread evenly from edge to edge.
-    DistributeLetter,
-    /// Letters spread evenly with half a gap at each edge.
-    DistributeSpace,
-    Left,
-    Right,
-    /// Right-aligned beside vertical text (laid out like `Right` in horizontal text).
-    RightVertical,
-}
-
-impl RubyAlign {
-    pub const ALL: [RubyAlign; 6] =
-        [RubyAlign::Center, RubyAlign::DistributeLetter, RubyAlign::DistributeSpace, RubyAlign::Left, RubyAlign::Right, RubyAlign::RightVertical];
-
-    /// The OOXML name (`center`, `distributeLetter`…), also used by commands.
-    pub fn ooxml(self) -> &'static str {
-        match self {
-            RubyAlign::Center => "center",
-            RubyAlign::DistributeLetter => "distributeLetter",
-            RubyAlign::DistributeSpace => "distributeSpace",
-            RubyAlign::Left => "left",
-            RubyAlign::Right => "right",
-            RubyAlign::RightVertical => "rightVertical",
-        }
-    }
-
-    pub fn from_ooxml(v: &str) -> Option<RubyAlign> {
-        RubyAlign::ALL.into_iter().find(|a| a.ooxml() == v)
-    }
-}
-
-/// Phonetic Guide's Offset for a ruby `raise` (baseline to baseline, points): the gap from the top
-/// of the base text to the bottom of the ruby text, taking letters as rising 0.8 em above their
-/// baseline and dropping 0.2 em below it.
-pub fn ruby_offset(raise: f32, base_size: f32, size: f32) -> f32 {
-    raise - 0.8 * base_size - 0.2 * size
-}
-
-/// The ruby raise (baseline to baseline, points) for a Phonetic Guide Offset (see [`ruby_offset`]).
-pub fn ruby_raise(offset: f32, base_size: f32, size: f32) -> f32 {
-    offset + 0.8 * base_size + 0.2 * size
-}
-
-/// An inline object anchored at a U+FFFC in the paragraph text.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum InlineObject {
-    Image {
-        /// Key in `Document::media`.
-        media: String,
-        /// Display size, points.
-        w: f32,
-        h: f32,
-        #[serde(default)]
-        alt: String,
-        #[serde(default)]
-        float: Float,
-        /// Crop (left, top, right, bottom) fractions 0..1.
-        #[serde(default)]
-        crop: [f32; 4],
-        /// The OLE object (embedded or linked file) this picture shows, as read from a file:
-        /// saving writes the object back, not only its picture. See [`crate::graphic::Embedded`].
-        #[serde(skip)]
-        ole: Option<std::sync::Arc<crate::graphic::Embedded>>,
-    },
-    /// A chart or SmartArt diagram (see [`crate::graphic`]).
-    Graphic {
-        w: f32,
-        h: f32,
-        #[serde(default)]
-        alt: String,
-        #[serde(default)]
-        float: Float,
-        graphic: std::sync::Arc<crate::graphic::Graphic>,
-    },
-    Shape {
-        kind: ShapeKind,
-        w: f32,
-        h: f32,
-        fill: Option<crate::props::Rgb>,
-        stroke: Option<crate::props::Rgb>,
-        #[serde(default)]
-        stroke_width: f32,
-        #[serde(default)]
-        float: Float,
-        /// Text box content: `Document::parts` id.
-        #[serde(default)]
-        story: Option<u32>,
-        /// A freeform's geometry (`ShapeKind::Freeform`): its paths, or an ink stroke.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        freeform: Option<std::sync::Arc<crate::freeform::Freeform>>,
-        /// Shadow, glow and soft edges.
-        #[serde(default, skip_serializing_if = "crate::effects::ShapeEffects::is_empty")]
-        effects: crate::effects::ShapeEffects,
-    },
-    /// Pictures, shapes and text boxes grouped into one object (Layout › Arrange › Group): it
-    /// moves, wraps and resizes as one. Its members are laid out in the group's own coordinate
-    /// space, `ch_w` × `ch_h`, which is stretched over the group's `w` × `h` (DrawingML's
-    /// `a:chExt` and `a:ext`), so resizing the group scales them.
-    Group {
-        w: f32,
-        h: f32,
-        #[serde(default)]
-        float: Float,
-        /// Size of the members' coordinate space (their offsets and sizes are in it).
-        ch_w: f32,
-        ch_h: f32,
-        children: Vec<GroupChild>,
-    },
-    /// A field: `instr` is the field code (`PAGE`, `NUMPAGES`, `DATE \@ "M/d/yyyy"`, `TOC \o "1-3"`…);
-    /// `result` the cached display text. A `locked` field keeps its result when fields update.
-    Field {
-        instr: String,
-        #[serde(default)]
-        result: String,
-        #[serde(default)]
-        locked: bool,
-        /// Shows its code (`{ PAGE }`) instead of its result, the other way round from the
-        /// document-wide View › Field Codes setting (`fields.toggleCode`, Shift+F9). A view
-        /// toggle: never written to files.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        code: bool,
-    },
-    /// The start of a field whose result is ordinary content — formatted, possibly spanning
-    /// paragraphs — up to the matching [`InlineObject::FieldEnd`]. Citation managers' `ADDIN`
-    /// fields (Zotero, Mendeley, EndNote) are kept this way; `instr` is the field code. See
-    /// [`crate::fields`].
-    FieldStart {
-        instr: String,
-        #[serde(default)]
-        locked: bool,
-    },
-    /// The end of the innermost open [`InlineObject::FieldStart`].
-    FieldEnd,
-    NoteRef {
-        kind: NoteKind,
-        /// `Document::parts` id of the note's story.
-        id: u32,
-        /// Custom mark (empty = automatic number).
-        #[serde(default)]
-        custom: String,
-    },
-    BookmarkStart {
-        name: String,
-    },
-    BookmarkEnd {
-        name: String,
-    },
-    CommentStart {
-        id: u32,
-    },
-    CommentEnd {
-        id: u32,
-    },
-    /// An equation: its linear format (`x=(-b±√(b^2-4ac))/2a`, for plain text) and structure.
-    /// A display equation sits on a line of its own.
-    Equation {
-        linear: String,
-        #[serde(default)]
-        display: bool,
-        /// The structure; empty = parse `linear`.
-        #[serde(default, skip_serializing_if = "crate::math::Math::is_empty")]
-        math: crate::math::Math,
-    },
-    /// Ruby (Phonetic Guide): small `ruby` text (furigana, pinyin…) set over `base` text. The base
-    /// text takes the formatting of the object's run; it reads as the paragraph's text.
-    Ruby {
-        base: String,
-        ruby: String,
-        #[serde(default)]
-        align: RubyAlign,
-        /// Ruby text size, points (`w:hps`).
-        size: f32,
-        /// From the base text's baseline up to the ruby text's baseline, points (`w:hpsRaise`).
-        raise: f32,
-        /// The base text size the ruby was set for, points (`w:hpsBaseText`).
-        #[serde(default)]
-        base_size: f32,
-        /// Language of the ruby (`w:lid`, e.g. `ja-JP`); empty = unspecified.
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        lang: String,
-        /// Formatting of the ruby text over the run's (font, colour…); its size is `size`.
-        #[serde(default, skip_serializing_if = "CharProps::is_empty")]
-        props: Box<CharProps>,
-    },
-    /// Something we don't model, kept for round-trip (raw XML of the source format).
-    Opaque {
-        format: String,
-        xml: String,
-        #[serde(default)]
-        text: String,
-    },
-}
-
-/// One member of an [`InlineObject::Group`]: a picture or shape (its own `w`, `h` and story), at
-/// `x`, `y` in the group's coordinate space. Its `float` is unused.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GroupChild {
-    pub x: f32,
-    pub y: f32,
-    pub obj: InlineObject,
-}
-
-/// Most members a group keeps (hostile files).
-pub const MAX_GROUP_CHILDREN: usize = 1000;
-
-impl InlineObject {
-    /// A picture, chart or diagram, shape, text box or group: something drawn with a frame, sized and wrapped.
-    pub fn is_drawing(&self) -> bool {
-        matches!(self, InlineObject::Image { .. } | InlineObject::Graphic { .. } | InlineObject::Shape { .. } | InlineObject::Group { .. })
-    }
-    /// A drawing's size and placement.
-    pub fn frame(&self) -> Option<(f32, f32, &Float)> {
-        match self {
-            InlineObject::Image { w, h, float, .. }
-            | InlineObject::Graphic { w, h, float, .. }
-            | InlineObject::Shape { w, h, float, .. }
-            | InlineObject::Group { w, h, float, .. } => Some((*w, *h, float)),
-            _ => None,
-        }
-    }
-    /// A drawing's placement, to change.
-    pub fn float_mut(&mut self) -> Option<&mut Float> {
-        match self {
-            InlineObject::Image { float, .. }
-            | InlineObject::Graphic { float, .. }
-            | InlineObject::Shape { float, .. }
-            | InlineObject::Group { float, .. } => Some(float),
-            _ => None,
-        }
-    }
-    /// Resize a drawing (a group's members scale with it).
-    pub fn set_size(&mut self, nw: f32, nh: f32) {
-        if let InlineObject::Image { w, h, .. }
-        | InlineObject::Graphic { w, h, .. }
-        | InlineObject::Shape { w, h, .. }
-        | InlineObject::Group { w, h, .. } = self
-        {
-            *w = nw;
-            *h = nh;
-        }
-    }
-    /// The text box story this object shows, if it is a text box.
-    pub fn text_box(&self) -> Option<u32> {
-        match self {
-            InlineObject::Shape { story, .. } => *story,
-            _ => None,
-        }
-    }
-    /// The text box stories this object shows: a text box's, or its group members'.
-    pub fn text_boxes(&self) -> Vec<u32> {
-        match self {
-            InlineObject::Shape { story: Some(id), .. } => vec![*id],
-            InlineObject::Group { children, .. } => children.iter().filter_map(|c| c.obj.text_box()).collect(),
-            _ => Vec::new(),
-        }
-    }
-    /// The text box story slots of this object and its group members, to repoint.
-    pub fn text_box_slots(&mut self) -> Vec<&mut Option<u32>> {
-        match self {
-            InlineObject::Shape { story, .. } => vec![story],
-            InlineObject::Group { children, .. } => children
-                .iter_mut()
-                .filter_map(|c| match &mut c.obj {
-                    InlineObject::Shape { story, .. } => Some(story),
-                    _ => None,
-                })
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
-    /// A group's members placed in a `w` × `h` box at (`x`, `y`): each member's rectangle
-    /// (x, y, w, h) and the member. Empty for anything else.
-    pub fn group_rects(&self, x: f32, y: f32, w: f32, h: f32) -> Vec<([f32; 4], &InlineObject)> {
-        let InlineObject::Group { ch_w, ch_h, children, .. } = self else { return Vec::new() };
-        let fin = |v: f32| if v.is_finite() { v } else { 0.0 };
-        let sx = if fin(*ch_w) > 0.0 { fin(w) / ch_w } else { 1.0 };
-        let sy = if fin(*ch_h) > 0.0 { fin(h) / ch_h } else { 1.0 };
-        children
-            .iter()
-            .take(MAX_GROUP_CHILDREN)
-            .filter_map(|c| {
-                let (cw, chh, _) = c.obj.frame()?;
-                let r = [x + fin(c.x) * sx, y + fin(c.y) * sy, (fin(cw) * sx).clamp(0.0, 4000.0), (fin(chh) * sy).clamp(0.0, 4000.0)];
-                (!matches!(c.obj, InlineObject::Group { .. })).then_some((r, &c.obj))
-            })
-            .collect()
-    }
-    /// Zero-width markers don't take part in layout.
-    pub fn is_marker(&self) -> bool {
-        matches!(
-            self,
-            InlineObject::BookmarkStart { .. }
-                | InlineObject::BookmarkEnd { .. }
-                | InlineObject::CommentStart { .. }
-                | InlineObject::CommentEnd { .. }
-                | InlineObject::FieldStart { .. }
-                | InlineObject::FieldEnd
-        )
-    }
-    pub fn is_floating(&self) -> bool {
-        match self {
-            InlineObject::Image { float, .. }
-            | InlineObject::Graphic { float, .. }
-            | InlineObject::Shape { float, .. }
-            | InlineObject::Group { float, .. } => float.wrap != Wrap::Inline,
-            _ => false,
-        }
-    }
-    /// The geometry of an ink stroke (a freeform shape drawn with a pen), if this is one.
-    pub fn ink(&self) -> Option<&crate::freeform::Freeform> {
-        match self {
-            InlineObject::Shape { freeform: Some(f), .. } if f.is_ink() => Some(f),
-            _ => None,
-        }
-    }
-    /// The text this object contributes to plain-text extraction.
-    pub fn plain_text(&self) -> &str {
-        match self {
-            InlineObject::Field { result, .. } => result,
-            InlineObject::Equation { linear, .. } => linear,
-            InlineObject::Ruby { base, .. } => base,
-            InlineObject::Opaque { text, .. } => text,
-            _ => "",
-        }
-    }
-}
+pub use float::{AltText, Anchor, Float, FloatAlign, MAX_ALT_TEXT, Wrap, WrapText, cap_alt};
+pub use inline_kinds::{NoteKind, PTabAlign, PTabBase, RubyAlign, ShapeKind, ruby_offset, ruby_raise};
+pub use inline_object::{CanvasStyle, GroupChild, InlineObject, MAX_GROUP_CHILDREN};
+pub use run::{COLUMN_BREAK, LINE_BREAK, NB_HYPHEN, NBSP, OBJ, PAGE_BREAK, Run, SOFT_HYPHEN, next_rev};
 
 /// A paragraph.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -690,6 +109,30 @@ impl Paragraph {
             } else {
                 out.push(c);
             }
+        }
+        out
+    }
+    /// [`Self::plain_text`] as it reads on screen: characters in runs set in a symbol font
+    /// (Symbol, Wingdings…) become their standard Unicode equivalents
+    /// ([`crate::symbol_fonts`]). For copying as text and plain-text export; the stored text is
+    /// unchanged.
+    pub fn shown_text(&self) -> String {
+        let mut out = String::with_capacity(self.text.len());
+        let mut k = 0;
+        let mut runs = self.run_ranges().peekable();
+        for (i, c) in self.text.char_indices() {
+            while runs.peek().is_some_and(|(r, _)| r.end <= i) {
+                runs.next();
+            }
+            if c == OBJ {
+                if let Some(o) = self.objects.get(k) {
+                    out.push_str(o.plain_text());
+                }
+                k += 1;
+                continue;
+            }
+            let font = runs.peek().filter(|(r, _)| r.contains(&i)).and_then(|(_, p)| p.shown_font());
+            out.push(font.and_then(|f| crate::symbol_fonts::symbol_char(f, c)).unwrap_or(c));
         }
         out
     }
@@ -809,6 +252,12 @@ impl Paragraph {
     pub fn object_offsets(&self) -> Vec<usize> {
         self.text.char_indices().filter(|(_, c)| *c == OBJ).map(|(i, _)| i).collect()
     }
+    /// (byte offset, object) for every object, in text order, in one pass. Prefer it to
+    /// [`Paragraph::object_offsets`] + [`Paragraph::object_at`], which counts the objects before
+    /// each offset again, so a loop over a paragraph's objects is quadratic (#3614).
+    pub fn objects_with_offsets(&self) -> impl Iterator<Item = (usize, &InlineObject)> + '_ {
+        self.text.char_indices().filter(|(_, c)| *c == OBJ).map(|(i, _)| i).zip(self.objects.iter())
+    }
 
     /// Insert plain text (U+FFFC is dropped) at `off` with `props`. Returns the inserted length.
     pub fn insert_text(&mut self, off: usize, s: &str, props: &CharProps) -> Result<usize> {
@@ -863,32 +312,32 @@ impl Paragraph {
 
     /// Merge adjacent equal runs and drop empty ones.
     pub fn normalize(&mut self) {
+        // Runs must end on character boundaries and cover the text exactly (never expected, but
+        // files lie): clamp each end to the text, push it past a split character, pad the tail.
+        let n = self.text.len();
+        let mut end = 0usize;
         let mut out: Vec<Run> = Vec::with_capacity(self.runs.len());
         for r in self.runs.drain(..) {
-            if r.len == 0 {
+            let mut e = end.saturating_add(r.len).min(n);
+            while !self.text.is_char_boundary(e) {
+                e += 1;
+            }
+            if e == end {
                 continue;
             }
             match out.last_mut() {
-                Some(l) if l.props == r.props => l.len += r.len,
-                _ => out.push(r),
+                Some(l) if l.props == r.props => l.len += e - end,
+                _ => out.push(Run { len: e - end, props: r.props }),
+            }
+            end = e;
+        }
+        if end < n {
+            match out.last_mut() {
+                Some(l) => l.len += n - end,
+                None => out.push(Run { len: n, props: self.mark.clone() }),
             }
         }
         self.runs = out;
-        // Repair a run list that doesn't cover the text exactly (never expected, but files lie).
-        let total: usize = self.runs.iter().map(|r| r.len).sum();
-        if total != self.text.len() {
-            if total < self.text.len() {
-                let p = self.runs.last().map(|r| r.props.clone()).unwrap_or_else(|| self.mark.clone());
-                self.runs.push(Run { len: self.text.len() - total, props: p });
-            } else {
-                let mut keep = self.text.len();
-                for r in &mut self.runs {
-                    r.len = r.len.min(keep);
-                    keep -= r.len;
-                }
-                self.runs.retain(|r| r.len > 0);
-            }
-        }
     }
 
     /// Delete `a..b` (bytes). Objects inside are removed.
@@ -902,7 +351,12 @@ impl Paragraph {
         if self.runs.is_empty() || a == 0 {
             // Keep the formatting of what's deleted for the mark when emptying.
             if b == self.text.len() {
-                self.mark = self.props_of_char(a).clone();
+                // Formatting only: the mark is a tracked change of its own or it is not, whatever
+                // revision the deleted text was part of.
+                let revisions = (self.mark.ins, self.mark.del, self.mark.fmt_change.clone());
+                let mut mark = self.props_of_char(a).clone();
+                (mark.ins, mark.del, mark.fmt_change) = revisions;
+                self.mark = mark;
             }
         }
         let k0 = self.objects_before(a);
@@ -920,6 +374,33 @@ impl Paragraph {
         }
         self.normalize();
         self.touch();
+        Ok(())
+    }
+
+    /// Delete `a..b` except the one-character objects at the offsets in `keep` (control
+    /// markers a deletion leaves in place).
+    pub fn delete_except(&mut self, a: usize, b: usize, keep: &[usize]) -> Result<()> {
+        let (a, b) = (a.min(b), a.max(b));
+        let mut keep: Vec<usize> =
+            keep.iter().copied().filter(|k| *k >= a && k + OBJ.len_utf8() <= b && self.text.get(*k..).is_some_and(|t| t.starts_with(OBJ))).collect();
+        if keep.is_empty() {
+            return self.delete(a, b);
+        }
+        keep.sort_unstable();
+        keep.dedup();
+        // Pieces between the kept objects, last first so earlier offsets stay valid.
+        let mut pieces = Vec::with_capacity(keep.len() + 1);
+        let mut from = a;
+        for k in &keep {
+            pieces.push((from, *k));
+            from = k + OBJ.len_utf8();
+        }
+        pieces.push((from, b));
+        for (x, y) in pieces.into_iter().rev() {
+            if y > x {
+                self.delete(x, y)?;
+            }
+        }
         Ok(())
     }
 
@@ -1011,19 +492,23 @@ impl Paragraph {
         self.touch();
     }
 
-    /// Previous grapheme boundary before `off` (0 at start).
+    /// Previous caret stop before `off` (0 at start): a grapheme boundary that doesn't split a
+    /// complex-script syllable ([`crate::cluster`]).
     pub fn prev_boundary(&self, off: usize) -> usize {
-        use unicode_segmentation::GraphemeCursor;
-        let off = self.clamp(off);
-        let mut c = GraphemeCursor::new(off, self.text.len(), true);
-        c.prev_boundary(&self.text, 0).ok().flatten().unwrap_or(0)
+        crate::cluster::prev_cluster(&self.text, self.clamp(off))
     }
-    /// Next grapheme boundary after `off` (len at end).
+    /// Next caret stop after `off` (len at end), see [`Self::prev_boundary`].
     pub fn next_boundary(&self, off: usize) -> usize {
-        use unicode_segmentation::GraphemeCursor;
+        crate::cluster::next_cluster(&self.text, self.clamp(off))
+    }
+    /// Where Backspace at `off` deletes from: one Arabic combining mark or one character in the
+    /// Brahmic scripts (Myanmar, Khmer, Devanagari, Thai…), otherwise the previous caret stop.
+    pub fn backspace_from(&self, off: usize) -> usize {
         let off = self.clamp(off);
-        let mut c = GraphemeCursor::new(off, self.text.len(), true);
-        c.next_boundary(&self.text, 0).ok().flatten().unwrap_or(self.text.len())
+        match self.text.get(..off).and_then(|t| t.char_indices().next_back()) {
+            Some((i, c)) if crate::cluster::backspaces_by_char(c) => i,
+            _ => self.prev_boundary(off),
+        }
     }
     /// Start of the word at or before `off` (Ctrl+Left).
     pub fn word_start(&self, off: usize) -> usize {
@@ -1103,7 +588,7 @@ impl Paragraph {
         let mut a = 0;
         let mut prev_end = false;
         for (i, c) in t.char_indices() {
-            if i >= off {
+            if i > off {
                 break;
             }
             if prev_end && c != ' ' {
@@ -1116,7 +601,9 @@ impl Paragraph {
             }
         }
         let mut b = t.len();
-        let mut ended = false;
+        // A caret on the space right after a sentence's end belongs to that sentence; a terminator
+        // directly followed by text ("Hello.World") doesn't end the sentence the caret is in.
+        let mut ended = t.get(..off).unwrap_or("").ends_with(['.', '!', '?']) && t.get(off..).unwrap_or("").starts_with(' ');
         for (i, c) in t.get(off..).unwrap_or("").char_indices() {
             if ended && c != ' ' {
                 b = off + i;
@@ -1134,6 +621,19 @@ impl Paragraph {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sentence_at_sentence_start() {
+        let p = Paragraph::with_text("Hello. World", CharProps::default());
+        assert_eq!(p.sentence_at(0), (0, 7));
+        assert_eq!(p.sentence_at(6), (0, 7));
+        assert_eq!(p.sentence_at(7), (7, 12));
+        assert_eq!(p.sentence_at(8), (7, 12));
+        assert_eq!(p.sentence_at(99), (7, 12));
+        let p = Paragraph::with_text("Hello.World", CharProps::default());
+        assert_eq!(p.sentence_at(6), (6, 11));
+        assert_eq!(p.sentence_at(8), (6, 11));
+    }
+
     fn bold() -> CharProps {
         CharProps { bold: Some(true), ..Default::default() }
     }
@@ -1142,8 +642,12 @@ mod tests {
     fn text_without_takes_ranges_in_any_order() {
         // Multi-byte chars at range edges, an object, and ranges unsorted, overlapping, nested and empty.
         let mut p = Paragraph::with_text("añb€c", CharProps::default());
-        p.insert_object(3, InlineObject::Field { instr: "PAGE".into(), result: "7".into(), locked: false, code: false }, &CharProps::default())
-            .unwrap();
+        p.insert_object(
+            3,
+            InlineObject::Field { instr: "PAGE".into(), result: "7".into(), locked: false, dirty: false, code: false, form: String::new() },
+            &CharProps::default(),
+        )
+        .unwrap();
         let text = p.text.clone();
         let naive = |dropped: &[std::ops::Range<usize>]| {
             let mut out = String::new();
@@ -1212,13 +716,22 @@ mod tests {
     #[test]
     fn objects_track_text() {
         let mut p = Paragraph::with_text("ab", CharProps::default());
-        p.insert_object(1, InlineObject::Field { instr: "PAGE".into(), result: "1".into(), locked: false, code: false }, &CharProps::default())
-            .unwrap();
+        p.insert_object(
+            1,
+            InlineObject::Field { instr: "PAGE".into(), result: "1".into(), locked: false, dirty: false, code: false, form: String::new() },
+            &CharProps::default(),
+        )
+        .unwrap();
         p.insert_object(0, InlineObject::BookmarkStart { name: "x".into() }, &CharProps::default()).unwrap();
         assert_eq!(p.objects.len(), 2);
         assert!(matches!(p.object_at(0), Some(InlineObject::BookmarkStart { .. })));
         let off = p.object_offsets()[1];
         assert!(matches!(p.object_at(off), Some(InlineObject::Field { .. })));
+        // The one-pass walk agrees with offsets + object_at.
+        let one_pass: Vec<(usize, &InlineObject)> = p.objects_with_offsets().collect();
+        let each: Vec<(usize, &InlineObject)> = p.object_offsets().into_iter().filter_map(|o| Some((o, p.object_at(o)?))).collect();
+        assert_eq!(one_pass, each);
+        assert_eq!(one_pass.len(), 2);
         assert_eq!(p.plain_text(), "a1b");
         p.delete(0, 3).unwrap();
         assert_eq!(p.objects.len(), 1);
@@ -1240,6 +753,24 @@ mod tests {
         let t = p.split_off(p.len()).unwrap();
         assert!(t.is_empty());
         assert_eq!(t.mark.bold, Some(true));
+    }
+
+    #[test]
+    fn emptying_a_paragraph_keeps_the_formatting_but_not_the_revisions_of_its_text() {
+        let mut props = bold();
+        props.ins = Some(3);
+        props.del = Some(4);
+        let mut p = Paragraph::with_text("Hello", props);
+        p.mark = bold();
+        p.delete(0, 5).unwrap();
+        assert!(p.is_empty());
+        assert_eq!(p.mark.bold, Some(true));
+        assert_eq!((p.mark.ins, p.mark.del), (None, None));
+        // A mark that is itself a tracked change keeps its own revision.
+        let mut p = Paragraph::with_text("Hello", bold());
+        p.mark.del = Some(7);
+        p.delete(0, 5).unwrap();
+        assert_eq!((p.mark.ins, p.mark.del), (None, Some(7)));
     }
 
     #[test]
